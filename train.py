@@ -67,6 +67,10 @@ except ImportError as e:
 
 has_compile = hasattr(torch, 'compile')
 
+import radt
+
+mlflow = None
+
 
 _logger = logging.getLogger('train')
 
@@ -762,76 +766,79 @@ def main():
         _logger.info(
             f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
-    try:
-        for epoch in range(start_epoch, num_epochs):
-            if hasattr(dataset_train, 'set_epoch'):
-                dataset_train.set_epoch(epoch)
-            elif args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
-                loader_train.sampler.set_epoch(epoch)
+    with radt.run.RADTBenchmark() as run:
+        global mlflow
+        mlflow = run
+        try:
+            for epoch in range(start_epoch, num_epochs):
+                if hasattr(dataset_train, 'set_epoch'):
+                    dataset_train.set_epoch(epoch)
+                elif args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
+                    loader_train.sampler.set_epoch(epoch)
 
-            train_metrics = train_one_epoch(
-                epoch,
-                model,
-                loader_train,
-                optimizer,
-                train_loss_fn,
-                args,
-                lr_scheduler=lr_scheduler,
-                saver=saver,
-                output_dir=output_dir,
-                amp_autocast=amp_autocast,
-                loss_scaler=loss_scaler,
-                model_ema=model_ema,
-                mixup_fn=mixup_fn,
-            )
+                train_metrics = train_one_epoch(
+                    epoch,
+                    model,
+                    loader_train,
+                    optimizer,
+                    train_loss_fn,
+                    args,
+                    lr_scheduler=lr_scheduler,
+                    saver=saver,
+                    output_dir=output_dir,
+                    amp_autocast=amp_autocast,
+                    loss_scaler=loss_scaler,
+                    model_ema=model_ema,
+                    mixup_fn=mixup_fn,
+                )
 
-            if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                if utils.is_primary(args):
-                    _logger.info("Distributing BatchNorm running means and vars")
-                utils.distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
-
-            eval_metrics = validate(
-                model,
-                loader_eval,
-                validate_loss_fn,
-                args,
-                amp_autocast=amp_autocast,
-            )
-
-            if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                    utils.distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
+                    if utils.is_primary(args):
+                        _logger.info("Distributing BatchNorm running means and vars")
+                    utils.distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-                ema_eval_metrics = validate(
-                    model_ema.module,
+                eval_metrics = validate(
+                    model,
                     loader_eval,
                     validate_loss_fn,
                     args,
                     amp_autocast=amp_autocast,
-                    log_suffix=' (EMA)',
-                )
-                eval_metrics = ema_eval_metrics
-
-            if output_dir is not None:
-                lrs = [param_group['lr'] for param_group in optimizer.param_groups]
-                utils.update_summary(
-                    epoch,
-                    train_metrics,
-                    eval_metrics,
-                    filename=os.path.join(output_dir, 'summary.csv'),
-                    lr=sum(lrs) / len(lrs),
-                    write_header=best_metric is None,
-                    log_wandb=args.log_wandb and has_wandb,
                 )
 
-            if saver is not None:
-                # save proper checkpoint with eval metric
-                save_metric = eval_metrics[eval_metric]
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+                if model_ema is not None and not args.model_ema_force_cpu:
+                    if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
+                        utils.distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
 
-            if lr_scheduler is not None:
-                # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                    ema_eval_metrics = validate(
+                        model_ema.module,
+                        loader_eval,
+                        validate_loss_fn,
+                        args,
+                        amp_autocast=amp_autocast,
+                        log_suffix=' (EMA)',
+                    )
+                    eval_metrics = ema_eval_metrics
+
+                # if output_dir is not None:
+                #     lrs = [param_group['lr'] for param_group in optimizer.param_groups]
+                #     utils.update_summary(
+                #         epoch,
+                #         train_metrics,
+                #         eval_metrics,
+                #         filename=os.path.join(output_dir, 'summary.csv'),
+                #         lr=sum(lrs) / len(lrs),
+                #         write_header=best_metric is None,
+                #         log_wandb=args.log_wandb and has_wandb,
+                #     )
+
+                # if saver is not None:
+                #     # save proper checkpoint with eval metric
+                #     save_metric = eval_metrics[eval_metric]
+                #     best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+
+                if lr_scheduler is not None:
+                    # step LR for next epoch
+                    lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
     except KeyboardInterrupt:
         pass
@@ -867,6 +874,8 @@ def train_one_epoch(
     update_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    
+    hiccup = 0
 
     model.train()
 
@@ -964,6 +973,9 @@ def train_one_epoch(
                 update_sample_count *= args.world_size
 
             if utils.is_primary(args):
+                if data_time_m.val > 0.1:
+                    hiccup += 1
+                
                 _logger.info(
                     f'Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
                     f'({100. * update_idx / (updates_per_epoch - 1):>3.0f}%)]  '
@@ -974,17 +986,29 @@ def train_one_epoch(
                     f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})'
                 )
 
-                if args.save_images and output_dir:
-                    torchvision.utils.save_image(
-                        input,
-                        os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
-                        padding=0,
-                        normalize=True
-                    )
+                ml_metrics = {}
+                ml_metrics["ML - Rate"] = (
+                    input.size(0) * args.world_size / update_time_m.avg
+                )
+                ml_metrics["ML - Loss"] = losses_m.avg
+                ml_metrics["ML - Hiccup"] = hiccup
 
-        if saver is not None and args.recovery_interval and (
-                (update_idx + 1) % args.recovery_interval == 0):
-            saver.save_recovery(epoch, batch_idx=update_idx)
+                ml_metrics["PT - Mem Reserved"] = float(torch.cuda.memory_reserved(0))
+                ml_metrics["PT - Mem Allocated"] = float(torch.cuda.memory_allocated(0))
+
+                mlflow.log_metrics(ml_metrics, epoch)
+
+                # if args.save_images and output_dir:
+                #     torchvision.utils.save_image(
+                #         input,
+                #         os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
+                #         padding=0,
+                #         normalize=True
+                #     )
+
+        # if saver is not None and args.recovery_interval and (
+        #         (update_idx + 1) % args.recovery_interval == 0):
+        #     saver.save_recovery(epoch, batch_idx=update_idx)
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
